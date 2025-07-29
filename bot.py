@@ -1,4 +1,5 @@
-#bot.py
+import requests
+from urllib.parse import quote
 import os
 import time
 import ccxt
@@ -61,6 +62,23 @@ class BybitTradingBot:
         }
         
         logger.info(f"Bot initialized with {len(self.symbols)} trading pairs")
+
+    def send_telegram_alert(self, message: str):
+        """Send message to Telegram channel"""
+        try:
+            bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+            chat_id = os.getenv('TELEGRAM_CHAT_ID')
+            
+            if not bot_token or not chat_id:
+                logger.warning("Telegram credentials not configured")
+                return False
+                
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            response = requests.post(url, json={'chat_id': chat_id, 'text': message})
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Telegram error: {str(e)}")
+            return False
 
     def _test_connection(self):
         """Test exchange connection with unified account params"""
@@ -224,7 +242,7 @@ class BybitTradingBot:
         )
 
     def find_trade_opportunity(self) -> Optional[Tuple[str, int, float]]:
-        """Scan all symbols for trading opportunities"""
+        """Scan all symbols for trading opportunities and send preview alerts"""
         portfolio_value = max(self.get_portfolio_value(), self.min_portfolio)
         position_size = portfolio_value * self.risk_per_trade
         
@@ -242,9 +260,22 @@ class BybitTradingBot:
                 signals = self.evaluate_strategies(df)
                 score = self.calculate_composite_score(signals)
                 
-                if abs(score) >= 0.6:  # Minimum confidence threshold
+                if abs(score) >= 0.6:
                     direction = 1 if score > 0 else -1
-                    logger.info(f"Opportunity found: {symbol} | Score: {score:.2f} | {'LONG' if direction == 1 else 'SHORT'}")
+                    side = 'LONG' if direction == 1 else 'SHORT'
+                    
+                    logger.info(f"Opportunity found: {symbol} | Score: {score:.2f} | {side}")
+                    
+                    # Send preview signal
+                    preview_msg = (
+                        f"🔍 <b>Potential Trade Detected</b>\n\n"
+                        f"<b>Pair:</b> {symbol}\n"
+                        f"<b>Direction:</b> {side}\n"
+                        f"<b>Confidence Score:</b> {score:.2f}/1.0\n\n"
+                        f"<i>Evaluating entry...</i>"
+                    )
+                    self.send_telegram_alert(preview_msg)
+                    
                     return symbol, direction, position_size
             
             except Exception as e:
@@ -253,7 +284,7 @@ class BybitTradingBot:
         return None, None, None
 
     def execute_trade(self, symbol: str, direction: int, position_size: float) -> bool:
-        """Execute trade with proper risk management"""
+        """Execute trade with proper risk management and send Telegram alert"""
         logger.info(f"Attempting {symbol} trade with size: {position_size:.2f} USDT")
         
         # Get current price with retries
@@ -303,11 +334,26 @@ class BybitTradingBot:
                 }
             )
             
+            # Send trade execution alert
+            alert_msg = (
+                f"🚀 <b>New Trade Signal</b> 🚀\n\n"
+                f"<b>Pair:</b> {symbol}\n"
+                f"<b>Direction:</b> {side.upper()}\n"
+                f"<b>Entry:</b> {price:.4f}\n"
+                f"<b>Stop Loss:</b> {sl_price:.4f}\n"
+                f"<b>Take Profit:</b> {tp_price:.4f}\n"
+                f"<b>Size:</b> {position_size:.2f} USDT\n"
+                f"<b>Leverage:</b> {self.leverage}x\n\n"
+                f"<i>Automated trade executed</i>"
+            )
+            self.send_telegram_alert(alert_msg)
+            
             logger.info(f"Trade executed: {symbol} | {side.upper()} | Qty: {qty:.4f}")
             return True
             
         except Exception as e:
             logger.error(f"Trade execution failed: {e}")
+            self.send_telegram_alert(f"❌ Trade failed: {symbol} - {str(e)}")
             return False
 
     def run(self):

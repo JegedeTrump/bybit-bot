@@ -1,12 +1,13 @@
-# bot.py
+#bot.py
 import os
 import time
 import ccxt
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
 import logging
+import sys
+from typing import Dict, Optional, Tuple
 
 # Setup logging
 logging.basicConfig(
@@ -26,54 +27,77 @@ class BybitTradingBot:
         
         # Configurable parameters
         self.leverage = 10
-        self.risk_per_trade = 0.01  # 1% of portfolio per trade
-        self.stop_loss = 0.015      # 1.5% stop loss
-        self.take_profit = 0.03    # 3% take profit
-        self.min_portfolio = 100    # Minimum portfolio value in USD
-        self.scan_interval = 60     # Seconds between scans
+        self.risk_per_trade = 0.01
+        self.stop_loss = 0.015
+        self.take_profit = 0.03
+        self.min_portfolio = 100
+        self.scan_interval = 60
+        self.min_order_size = 5
+        self.timeframe = '1h'
         
         # Initialize exchange
-        self.exchange = self._initialize_exchange()
-        self.symbols = self._get_available_symbols()
-        
-        # Strategy weights
-        self.strategy_weights = {
-            'bollinger': 0.35,
-            'rsi': 0.25,
-            'macd': 0.25,
-            'volume': 0.15
-        }
-        
-        logger.info("Bot initialized with %d trading pairs", len(self.symbols))
-
-    def _initialize_exchange(self):
-        return ccxt.bybit({
+        self.exchange = ccxt.bybit({
             'apiKey': self.api_key,
             'secret': self.api_secret,
             'enableRateLimit': True,
-            'options': {'defaultType': 'future'},
-            'rateLimit': 100  # ms between requests
+            'options': {
+                'defaultType': 'swap',
+                'accountType': 'UNIFIED'
+            }
         })
+        
+        # Test connection
+        self._test_connection()
+        self.symbols = self._get_available_symbols()
+        
+        # Enhanced Strategy Configuration
+        self.strategy_weights = {
+            'bollinger_bands_reversal': 0.25,
+            'rsi_divergence': 0.20,
+            'macd_crossover': 0.20,
+            'volume_spike': 0.15,
+            'ema_crossover': 0.10,
+            'obv_breakout': 0.10
+        }
+        
+        logger.info(f"Bot initialized with {len(self.symbols)} trading pairs")
+
+    def _test_connection(self):
+        """Test exchange connection with unified account params"""
+        try:
+            balance = self.exchange.private_get_v5_account_wallet_balance({
+                'accountType': 'UNIFIED'
+            })
+            usdt_balance = float(balance['result']['list'][0]['coin'][0]['walletBalance'])
+            logger.info(f"Successfully connected to Bybit. USDT Balance: {usdt_balance:.2f}")
+            return True
+        except Exception as e:
+            logger.error(f"Connection failed: {str(e)}")
+            raise ConnectionError("Failed to connect to Bybit API")
 
     def _get_available_symbols(self):
+        """Get available USDT perpetual contracts"""
         markets = self.exchange.load_markets()
         return [
             symbol for symbol in markets 
-            if '/USDT' in symbol and markets[symbol]['active']
+            if symbol.endswith('USDT') and 'swap' in markets[symbol]['type']
         ]
 
     def get_portfolio_value(self):
         """Get total portfolio value in USDT"""
         try:
-            balance = self.exchange.fetch_balance()
-            return float(balance['USDT']['total'])
+            balance = self.exchange.private_get_v5_account_wallet_balance({
+                'accountType': 'UNIFIED'
+            })
+            return float(balance['result']['list'][0]['coin'][0]['walletBalance'])
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
-            return self.min_portfolio  # Fallback value
+            return self.min_portfolio
 
-    def fetch_ohlcv(self, symbol, timeframe='1h', limit=100):
+    def fetch_ohlcv(self, symbol, timeframe=None, limit=100):
         """Fetch OHLCV data with retry logic"""
-        for _ in range(3):  # Retry up to 3 times
+        timeframe = timeframe or self.timeframe
+        for _ in range(3):
             try:
                 ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -84,15 +108,38 @@ class BybitTradingBot:
                 time.sleep(2)
         return None
 
-    # Pure Python technical indicators
-    def calculate_bbands(self, close, period=20, std_dev=2):
+    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate all technical indicators"""
+        # Bollinger Bands
+        df['bb_upper'], df['bb_middle'], df['bb_lower'] = self._calculate_bbands(df['close'])
+        
+        # RSI
+        df['rsi'] = self._calculate_rsi(df['close'])
+        
+        # MACD
+        df['macd'], df['signal'], _ = self._calculate_macd(df['close'])
+        
+        # Volume Analysis
+        df['volume_ma'] = df['volume'].rolling(20).mean()
+        df['volume_spike'] = df['volume'] / df['volume_ma']
+        
+        # EMA Cross
+        df['ema_short'] = df['close'].ewm(span=9, adjust=False).mean()
+        df['ema_long'] = df['close'].ewm(span=21, adjust=False).mean()
+        
+        # OBV
+        df['obv'] = self._calculate_obv(df['close'], df['volume'])
+        
+        return df.dropna()
+
+    def _calculate_bbands(self, close: pd.Series, period: int = 20, std_dev: int = 2):
         sma = close.rolling(period).mean()
         std = close.rolling(period).std()
         upper = sma + (std * std_dev)
         lower = sma - (std * std_dev)
         return upper, sma, lower
 
-    def calculate_rsi(self, close, period=14):
+    def _calculate_rsi(self, close: pd.Series, period: int = 14):
         delta = close.diff()
         gain = delta.where(delta > 0, 0)
         loss = -delta.where(delta < 0, 0)
@@ -103,66 +150,88 @@ class BybitTradingBot:
         rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
 
-    def calculate_macd(self, close, fast=12, slow=26, signal=9):
+    def _calculate_macd(self, close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
         ema_fast = close.ewm(span=fast, adjust=False).mean()
         ema_slow = close.ewm(span=slow, adjust=False).mean()
         macd = ema_fast - ema_slow
         signal_line = macd.ewm(span=signal, adjust=False).mean()
-        return macd, signal_line
+        histogram = macd - signal_line
+        return macd, signal_line, histogram
 
-    def calculate_indicators(self, df):
-        # Calculate all indicators
-        df['bb_upper'], df['bb_middle'], df['bb_lower'] = self.calculate_bbands(df['close'])
-        df['rsi'] = self.calculate_rsi(df['close'])
-        df['macd'], df['signal'] = self.calculate_macd(df['close'])
-        df['volume_ma'] = df['volume'].rolling(20).mean()
-        df['volume_spike'] = df['volume'] / df['volume_ma']
-        return df.dropna()
+    def _calculate_obv(self, close: pd.Series, volume: pd.Series):
+        obv = [0]
+        for i in range(1, len(close)):
+            if close[i] > close[i-1]:
+                obv.append(obv[-1] + volume[i])
+            elif close[i] < close[i-1]:
+                obv.append(obv[-1] - volume[i])
+            else:
+                obv.append(obv[-1])
+        return pd.Series(obv, index=close.index)
 
-    def evaluate_strategies(self, df):
-        """Evaluate trading strategies based on indicators"""
+    def evaluate_strategies(self, df: pd.DataFrame) -> Dict[str, float]:
+        """Evaluate all trading strategies"""
         signals = {}
         last = df.iloc[-1]
         prev = df.iloc[-2]
         
-        # Bollinger Bands strategy
-        signals['bollinger'] = 0
+        # Bollinger Bands Reversal
+        signals['bollinger_bands_reversal'] = 0
         if last['close'] < last['bb_lower']:
-            signals['bollinger'] = 1  # Oversold, buy signal
+            signals['bollinger_bands_reversal'] = 1
         elif last['close'] > last['bb_upper']:
-            signals['bollinger'] = -1  # Overbought, sell signal
+            signals['bollinger_bands_reversal'] = -1
         
-        # RSI strategy
-        signals['rsi'] = 0
+        # RSI Divergence
+        signals['rsi_divergence'] = 0
         if last['rsi'] < 30 and prev['rsi'] >= 30:
-            signals['rsi'] = 1
+            signals['rsi_divergence'] = 1
         elif last['rsi'] > 70 and prev['rsi'] <= 70:
-            signals['rsi'] = -1
+            signals['rsi_divergence'] = -1
         
-        # MACD strategy
-        signals['macd'] = 0
+        # MACD Crossover
+        signals['macd_crossover'] = 0
         if last['macd'] > last['signal'] and prev['macd'] <= prev['signal']:
-            signals['macd'] = 1  # Bullish crossover
+            signals['macd_crossover'] = 1
         elif last['macd'] < last['signal'] and prev['macd'] >= prev['signal']:
-            signals['macd'] = -1  # Bearish crossover
+            signals['macd_crossover'] = -1
         
-        # Volume spike strategy
-        signals['volume'] = 1 if last['volume_spike'] > 1.5 else 0
+        # Volume Spike
+        signals['volume_spike'] = 1 if last['volume_spike'] > 1.5 else 0
+        
+        # EMA Crossover
+        signals['ema_crossover'] = 0
+        if last['ema_short'] > last['ema_long'] and prev['ema_short'] <= prev['ema_long']:
+            signals['ema_crossover'] = 1
+        elif last['ema_short'] < last['ema_long'] and prev['ema_short'] >= prev['ema_long']:
+            signals['ema_crossover'] = -1
+        
+        # OBV Breakout
+        signals['obv_breakout'] = 0
+        obv_ma = df['obv'].rolling(20).mean()
+        if last['obv'] > obv_ma[-1] and prev['obv'] <= obv_ma[-2]:
+            signals['obv_breakout'] = 1
+        elif last['obv'] < obv_ma[-1] and prev['obv'] >= obv_ma[-2]:
+            signals['obv_breakout'] = -1
         
         return signals
 
-    def calculate_score(self, signals):
+    def calculate_composite_score(self, signals: Dict[str, float]) -> float:
         """Calculate weighted composite score"""
         return sum(
-            self.strategy_weights[k] * v 
-            for k, v in signals.items()
+            self.strategy_weights[strat] * signal 
+            for strat, signal in signals.items()
         )
 
-    def find_trade_opportunity(self):
+    def find_trade_opportunity(self) -> Optional[Tuple[str, int, float]]:
         """Scan all symbols for trading opportunities"""
         portfolio_value = max(self.get_portfolio_value(), self.min_portfolio)
         position_size = portfolio_value * self.risk_per_trade
         
+        if position_size < self.min_order_size:
+            logger.warning(f"Position size too small: {position_size:.2f} USDT")
+            return None, None, None
+            
         for symbol in self.symbols:
             try:
                 df = self.fetch_ohlcv(symbol)
@@ -171,7 +240,7 @@ class BybitTradingBot:
                     
                 df = self.calculate_indicators(df)
                 signals = self.evaluate_strategies(df)
-                score = self.calculate_score(signals)
+                score = self.calculate_composite_score(signals)
                 
                 if abs(score) >= 0.6:  # Minimum confidence threshold
                     direction = 1 if score > 0 else -1
@@ -183,23 +252,38 @@ class BybitTradingBot:
         
         return None, None, None
 
-    def execute_trade(self, symbol, direction, position_size):
+    def execute_trade(self, symbol: str, direction: int, position_size: float) -> bool:
         """Execute trade with proper risk management"""
-        try:
-            # Get current price
-            ticker = self.exchange.fetch_ticker(symbol)
-            price = ticker['last']
-            if not price:
-                logger.error(f"Failed to get price for {symbol}")
-                return False
-                
-            # Calculate position size
-            contract_size = float(self.exchange.market(symbol)['contractSize'])
-            qty = (position_size * self.leverage) / (price * contract_size)
-            qty = round(qty, self.exchange.market(symbol)['precision']['amount'])
+        logger.info(f"Attempting {symbol} trade with size: {position_size:.2f} USDT")
+        
+        # Get current price with retries
+        price = None
+        for _ in range(3):
+            try:
+                ticker = self.exchange.fetch_ticker(symbol)
+                price = float(ticker['last'])
+                if price > 0:
+                    break
+            except:
+                time.sleep(1)
+        
+        if not price:
+            logger.error(f"Could not get valid price for {symbol}")
+            return False
             
+        # Check minimum order size
+        if (position_size * self.leverage) < self.min_order_size:
+            logger.warning(f"Position size too small after leverage: {(position_size * self.leverage):.2f} USDT")
+            return False
+            
+        try:
             # Set leverage
             self.exchange.set_leverage(self.leverage, symbol)
+            
+            # Calculate position quantity
+            market = self.exchange.market(symbol)
+            qty = (position_size * self.leverage) / price
+            qty = round(qty, market['precision']['amount'])
             
             # Calculate stop loss and take profit
             sl_price = price * (1 - self.stop_loss) if direction == 1 else price * (1 + self.stop_loss)
@@ -213,12 +297,13 @@ class BybitTradingBot:
                 side=side,
                 amount=qty,
                 params={
-                    'stopLoss': sl_price,
-                    'takeProfit': tp_price
+                    'stopLoss': str(sl_price),
+                    'takeProfit': str(tp_price),
+                    'positionIdx': 0
                 }
             )
             
-            logger.info(f"Trade executed: {symbol} | {side} | Qty: {qty} | SL: {sl_price:.4f} | TP: {tp_price:.4f}")
+            logger.info(f"Trade executed: {symbol} | {side.upper()} | Qty: {qty:.4f}")
             return True
             
         except Exception as e:
@@ -226,6 +311,7 @@ class BybitTradingBot:
             return False
 
     def run(self):
+        """Main trading loop"""
         logger.info("Starting trading bot...")
         while True:
             try:
@@ -244,5 +330,9 @@ class BybitTradingBot:
                 time.sleep(self.scan_interval * 2)
 
 if __name__ == "__main__":
-    bot = BybitTradingBot()
-    bot.run()
+    try:
+        bot = BybitTradingBot()
+        bot.run()
+    except Exception as e:
+        logger.error(f"Bot failed to start: {e}")
+        sys.exit(1)

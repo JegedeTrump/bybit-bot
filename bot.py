@@ -25,7 +25,9 @@ class BybitTradingBot:
     def __init__(self):
         self.api_key = os.getenv('BYBIT_API_KEY')
         self.api_secret = os.getenv('BYBIT_API_SECRET')
-        
+        self.trade_count = 0
+        self.total_profit = 0
+
         # Configurable parameters
         self.leverage = 10
         self.risk_per_trade = 0.01
@@ -287,6 +289,15 @@ class BybitTradingBot:
         """Execute trade with proper risk management and send Telegram alert"""
         logger.info(f"Attempting {symbol} trade with size: {position_size:.2f} USDT")
         
+        if direction == 1:  # Long
+            profit = (ticker['last'] - price) * qty
+        else:  # Short
+            profit = (price - ticker['last']) * qty
+
+        self.total_profit += profit
+        self.trade_count += 1
+        logger.info(f"Cumulative P&L: ${self.total_profit:.2f} | Trades: {self.trade_count}")
+        
         # Get current price with retries
         price = None
         for _ in range(3):
@@ -332,8 +343,9 @@ class BybitTradingBot:
                     'takeProfit': str(tp_price),
                     'positionIdx': 0
                 }
+                
             )
-            
+
             # Send trade execution alert
             alert_msg = (
                 f"🚀 <b>New Trade Signal</b> 🚀\n\n"
